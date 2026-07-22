@@ -284,6 +284,16 @@ Levantado via `databricks jobs list` + `databricks apps list` (só existem 5 job
 
 Não foram encontrados outros jobs, pipelines DLT/Lakeflow, ou dashboards SQL Warehouse referenciando `iop.raw` além destes. **Isso não é garantia de completude** — não foram varridas queries de SQL Warehouse/Genie nem notebooks fora dos workspaces de usuário já conhecidos.
 
+### Projeto relacionado, mas **não sobreposto**: `iop-extract`
+
+Existe um Git Folder em `/Repos/spesia_product/iop-extract` (`github.com/GRUPOMED4U/iop-extract`) que **não é este pipeline nem depende dele**. É um projeto Python (Poetry) separado, deployado via Docker/GKE (CronJob no Kubernetes), que:
+
+- Conecta **direto no Oracle** via `python-oracledb`/Instant Client (rede privada GCP↔OCI), **sem passar pelo Databricks nem pelo `iop.raw`**.
+- Faz extração + NLP/regex + unificação por paciente.
+- Publica o resultado em **MongoDB** (via Beanie/Pydantic), para alimentar pipelines de ML — não em Unity Catalog.
+
+Ou seja: hoje existem **dois caminhos de extração do mesmo Oracle**, independentes um do outro — este repositório (Databricks/`iop.raw`) e o `iop-extract` (GKE/MongoDB). Vale ter isso em mente ao avaliar carga no Oracle de origem, mas não há necessidade de unificá-los como parte desta migração.
+
 ---
 
 ## Ownership atual e bus factor
@@ -311,6 +321,7 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 | Repositório Git + `README.md` + `CLAUDE.md` | ✅ feito |
 | Decisões da Etapa 1 (M4 fica pra depois, grupos reaproveitados, SP dedicado, grants aditivos) | ✅ feito (2026-07-21) |
 | Grants aditivos `spesia-data-ro/rw/admins` no `iop` | ✅ feito (2026-07-21) — `account users: ALL_PRIVILEGES` ainda ativo de propósito |
+| Git Folder no workspace (`/Repos/spesia_product/dtb-iop-raw-elt`) | ✅ feito (2026-07-22) |
 | Portar notebooks para `.py` versionável | ❌ não iniciado |
 | Databricks Asset Bundle (`databricks.yml`) | ❌ não iniciado |
 | Job clusters no lugar de clusters interativos | ❌ não iniciado |
@@ -327,7 +338,22 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 
 ## Como rodar / deployar (planejado)
 
-Ainda não implementado. O plano é replicar o padrão do projeto `clinical-doc-extractor`:
+O modelo GitOps deste projeto tem duas partes, replicando o padrão já usado nos projetos irmãos `iop-extract` e `natural-language-extractors`/`clinical-doc-extractor`:
+
+### 1. Git Folder no workspace (feito em 2026-07-22)
+
+Um **Git Folder** (Databricks Repos) em `/Repos/spesia_product/dtb-iop-raw-elt`, apontando para este repositório (branch `main`), criado via:
+
+```bash
+databricks repos create "https://github.com/GRUPOMED4U/dtb-iop-raw-elt.git" gitHub \
+  --path "/Repos/spesia_product/dtb-iop-raw-elt"
+```
+
+Isso dá uma cópia navegável/editável do código dentro do Databricks, sincronizada com o GitHub — o mesmo mecanismo já usado por `iop-extract` e `natural-language-extractors` (pasta compartilhada `/Repos/spesia_product/`, não pessoal). **Importante:** essa sincronização não é automática a cada push — é preciso rodar `databricks repos update` (ou usar a UI) para puxar commits novos para o Git Folder.
+
+### 2. Databricks Asset Bundle (ainda não implementado)
+
+O deploy real dos jobs/clusters/schedules será feito via Asset Bundle, replicando o padrão do `clinical-doc-extractor` (que foi deployado assim, não a partir do Git Folder):
 
 ```bash
 databricks bundle validate --target dev
