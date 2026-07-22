@@ -322,17 +322,21 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 | Decisões da Etapa 1 (M4 fica pra depois, grupos reaproveitados, SP dedicado, grants aditivos) | ✅ feito (2026-07-21) |
 | Grants aditivos `spesia-data-ro/rw/admins` no `iop` | ✅ feito (2026-07-21) — `account users: ALL_PRIVILEGES` ainda ativo de propósito |
 | Git Folder no workspace (`/Repos/spesia_product/dtb-iop-raw-elt`) | ✅ feito (2026-07-22) |
-| Portar notebooks para `.py` versionável | ❌ não iniciado |
-| Databricks Asset Bundle (`databricks.yml`) | ❌ não iniciado |
+| Service principal dedicado (`sp-iop-elt`) | ✅ criado (2026-07-22), membro de `spesia-data-rw` |
+| Autenticação CI via Workload Identity Federation (OIDC, sem secret) | ✅ feito (2026-07-22) — 2 federation policies (dev/prod) |
+| GitHub Environments `dev`/`prod` | ✅ feito (2026-07-22) — `prod` sem revisor obrigatório ainda (ver Riscos) |
+| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto criado (2026-07-22) — 2 targets, **nenhum job/resource ainda** |
+| GitHub Action de teste de conexão (`test-connection.yml`) | ✅ feito (2026-07-22) — só autentica + valida bundle, não deploya nada |
+| GitHub Action de deploy automático (dev on push / prod manual) | ❌ não iniciado — só faz sentido quando houver um job completo pra deployar |
+| Portar notebooks para `.py` versionável | 🟡 1 de ~14 portado localmente (`create_tb_diferencial_paths`/`NTB01`, `load_files_ged`) — **ainda não commitado**, em revisão |
 | Job clusters no lugar de clusters interativos | ❌ não iniciado |
-| CI (lint/testes) | ❌ não iniciado |
+| CI (lint/testes) | 🟡 estrutura de testes criada (`pytest`), ainda não rodada em CI |
 | Carga incremental (watermark/MERGE) | ❌ não iniciado — hoje só `EVOLUCAO_PACIENTE`/`PROTOCOLO` têm alguma incrementalidade parcial (extração da coluna LONG), o full-load principal continua overwrite total |
-| Service principal dedicado (`sp-iop-elt`) | ❌ não criado — planejado para quando o Asset Bundle for escrito |
-| Ownership de jobs/notebooks/connections | ❌ não iniciado — tudo ainda em nome do Jefferson |
+| Ownership de jobs/notebooks/connections legados | ❌ não iniciado — tudo ainda em nome do Jefferson |
 | Revogar `account users: ALL_PRIVILEGES` no `iop` | ❌ não feito — de propósito, aguardando confiança de que nada depende só dele |
 | Cutover em produção | ❌ não iniciado — **os 2 jobs legados continuam rodando exatamente como estão** |
 
-**Nada foi portado ainda.** Toda a lógica de produção descrita neste README ainda roda exclusivamente como notebooks na pasta pessoal do Jefferson, sem Git.
+A lógica de produção descrita nas seções acima (jobs `extracao_tabelas_oracle` e `load_files_ged`) ainda roda **exclusivamente** como notebooks na pasta pessoal do Jefferson, sem Git — o trabalho de porte está começando, notebook por notebook.
 
 ---
 
@@ -351,9 +355,15 @@ databricks repos create "https://github.com/GRUPOMED4U/dtb-iop-raw-elt.git" gitH
 
 Isso dá uma cópia navegável/editável do código dentro do Databricks, sincronizada com o GitHub — o mesmo mecanismo já usado por `iop-extract` e `natural-language-extractors` (pasta compartilhada `/Repos/spesia_product/`, não pessoal). **Importante:** essa sincronização não é automática a cada push — é preciso rodar `databricks repos update` (ou usar a UI) para puxar commits novos para o Git Folder.
 
-### 2. Databricks Asset Bundle (ainda não implementado)
+### 2. Databricks Asset Bundle (esqueleto criado em 2026-07-22, sem jobs ainda)
 
-O deploy real dos jobs/clusters/schedules será feito via Asset Bundle, replicando o padrão do `clinical-doc-extractor` (que foi deployado assim, não a partir do Git Folder):
+O deploy real dos jobs/clusters/schedules é feito via Asset Bundle (`databricks.yml`), replicando o padrão do `clinical-doc-extractor` (que foi deployado assim, não a partir do Git Folder). Hoje o `databricks.yml` só declara os 2 targets — **nenhum job/resource ainda**, porque só portamos 1 de ~14 notebooks até agora:
+
+```yaml
+targets:
+  dev:   # https://8259557250383794.4.gcp.databricks.com
+  prod:  # https://8259561315104258.8.gcp.databricks.com
+```
 
 ```bash
 databricks bundle validate --target dev
@@ -361,7 +371,37 @@ databricks bundle deploy --target dev
 databricks bundle deploy --target prod   # só com autorização explícita, após validação em paralelo
 ```
 
-Detalhes de configuração (`databricks.yml`, targets, service principal de execução) serão adicionados aqui conforme forem implementados — **esta seção deve ser atualizada no mesmo commit/PR que introduzir o Asset Bundle.**
+### 3. Identidade de execução: `sp-iop-elt` (criado em 2026-07-22)
+
+Service principal dedicado para rodar deploys/jobs deste projeto — nunca usuário pessoal:
+
+- **Nome:** `sp-iop-elt` — **application id (client id):** `83de5c11-53ff-4142-bee7-7fc04713f273` — **account id (SCIM):** `217897259508188`.
+- **Grants:** nenhum grant direto — é membro do grupo `spesia-data-rw`, herdando exatamente os privilégios já concedidos no `iop` na Etapa 1 (`SELECT`, `USE_CATALOG`, `USE_SCHEMA`, `CREATE_TABLE`, `MODIFY`, `WRITE_VOLUME`, etc.).
+- **Acesso ao workspace:** herdado via `spesia-data-rw`, que já está atribuído (`USER`) tanto no workspace dev quanto no prod.
+
+### 4. Autenticação do CI: Workload Identity Federation (OIDC), sem secret nenhum
+
+O GitHub Actions autentica como `sp-iop-elt` via **OIDC federation** — nenhum token/senha fica guardado no GitHub. Duas federation policies foram criadas no `sp-iop-elt` (uma por ambiente):
+
+```bash
+databricks account service-principal-federation-policy create 217897259508188 --json '{
+  "oidc_policy": {
+    "issuer": "https://token.actions.githubusercontent.com",
+    "audiences": ["804f131d-b219-46da-9cc6-c2a511f6f911"],
+    "subject": "repo:GRUPOMED4U/dtb-iop-raw-elt:environment:<dev|prod>"
+  }
+}'
+```
+
+O `subject` amarra a autenticação a um **GitHub Environment** específico (`dev` ou `prod`) — só um workflow rodando sob aquele ambiente consegue o token OIDC com o claim certo para autenticar.
+
+### 5. GitHub Environments (`dev` / `prod`)
+
+Criados no repositório (`dev`: sem restrição; `prod`: restrito à branch `main` via `deployment_branch_policy`). **Ainda sem revisor obrigatório configurado** — decisão consciente por ora, para não precisar montar times/permissões no GitHub agora (ver [Riscos conhecidos](#riscos-conhecidos)). O gate de "prod só com autorização explícita" hoje é: o workflow de prod só roda via `workflow_dispatch` (disparo manual), nunca automaticamente por push.
+
+### 6. GitHub Action `test-connection.yml`
+
+Primeira Action do projeto (`.github/workflows/test-connection.yml`): roda em todo push para `main` e também sob demanda (`workflow_dispatch`). Autentica como `sp-iop-elt` contra o workspace **dev** via OIDC e roda `databricks current-user me` + `databricks bundle validate --target dev` — só valida que a cadeia de autenticação/config funciona, não faz deploy nem toca em nenhum dado.
 
 ---
 
@@ -374,6 +414,7 @@ Detalhes de configuração (`databricks.yml`, targets, service principal de exec
 - **`tb_iop_bi_projecao_receita_view_chama`:** cresce indefinidamente via `append` sem dedupe — reprocessamento/backfill duplicaria dados.
 - **Governança do `iop`:** o grant amplo de `account users` pode estar mascarando dependências (alguém pode estar lendo `iop.raw` sem que isso apareça em nenhum job/app conhecido) — revisar com cautela antes de restringir.
 - **Notebooks auxiliares não inspecionados em profundidade** (`old/`, `pysmb/`, "New Notebook..."): podem conter lógica ainda relevante ou lixo histórico — não assumir nenhuma das duas coisas sem checar.
+- **Ambiente `prod` do GitHub sem revisor obrigatório:** hoje o único gate antes de um deploy em produção é o workflow ser `workflow_dispatch` (manual). Não há um segundo par de olhos forçado via GitHub Environment protection rule — considerar adicionar revisores nomeados (usuário ou time) quando a governança de times no GitHub estiver mais estruturada.
 
 ---
 

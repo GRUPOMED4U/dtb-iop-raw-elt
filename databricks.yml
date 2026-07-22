@@ -1,0 +1,17 @@
+bundle:
+  name: dtb-iop-raw-elt
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://8259557250383794.4.gcp.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://8259561315104258.8.gcp.databricks.com

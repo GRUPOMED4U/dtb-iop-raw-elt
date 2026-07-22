@@ -1,0 +1,29 @@
+name: Test Databricks Connection
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: https://8259557250383794.4.gcp.databricks.com
+      DATABRICKS_CLIENT_ID: 83de5c11-53ff-4142-bee7-7fc04713f273
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Verifica autenticação (sp-iop-elt via OIDC)
+        run: databricks current-user me
+
+      - name: Valida o Asset Bundle (target dev)
+        run: databricks bundle validate --target dev
