@@ -23,6 +23,7 @@ ELT do IOP: extração do Oracle (Tasy) e do GED (arquivos on-prem via SMB) para
 - [Achados de governança](#achados-de-governança)
 - [Estado da migração](#estado-da-migração)
 - [Como rodar / deployar (planejado)](#como-rodar--deployar-planejado)
+- [Spike: Lakeflow Declarative Pipelines pro lado Oracle](#spike-lakeflow-declarative-pipelines-pro-lado-oracle)
 - [Riscos conhecidos](#riscos-conhecidos)
 - [Referências](#referências)
 
@@ -325,8 +326,9 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 | Service principal dedicado (`sp-iop-elt`) | ✅ criado (2026-07-22) — grants escopados só a `iop.raw` (corrigido depois de ter sido criado catalog-wide via `spesia-data-rw`; acesso ao workspace agora é direto, não por grupo) |
 | Autenticação CI via Workload Identity Federation (OIDC, sem secret) | ✅ **validado de ponta a ponta** (2026-07-22) — policy de dev confirmada rodando na Action; policy de prod criada mas ainda não testada |
 | GitHub Environments `dev`/`prod` | ✅ feito (2026-07-22) — `prod` sem revisor obrigatório ainda (ver Riscos) |
-| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto criado e validado (2026-07-22, `bundle validate` passou local e em CI) — 2 targets, **nenhum job/resource ainda** |
+| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto validado (2026-07-22) — 2 targets, 1 resource de pipeline (spike, ver abaixo), nenhum job de produção ainda |
 | GitHub Action de teste de conexão (`test-connection.yml`) | ✅ **rodou com sucesso em produção** (2026-07-22) — autenticou como `sp-iop-elt`, validou o bundle, não deploya nada |
+| Spike Lakeflow Declarative Pipelines (Oracle) | 🟡 arquivos criados, `bundle validate` passou local (2026-07-22) — **ainda não deployado nem rodado de verdade**, ver [seção dedicada](#spike-lakeflow-declarative-pipelines-pro-lado-oracle) |
 | GitHub Action de deploy automático (dev on push / prod manual) | ❌ não iniciado — só faz sentido quando houver um job completo pra deployar |
 | Portar notebooks para `.py` versionável | 🟡 1 de ~14 portado localmente (`create_tb_diferencial_paths`/`NTB01`, `load_files_ged`) — **ainda não commitado**, em revisão |
 | Job clusters no lugar de clusters interativos | ❌ não iniciado |
@@ -418,6 +420,44 @@ Criados no repositório (`dev`: sem restrição; `prod`: restrito à branch `mai
 ### 6. GitHub Action `test-connection.yml`
 
 Primeira Action do projeto (`.github/workflows/test-connection.yml`): roda em todo push para `main` e também sob demanda (`workflow_dispatch`). Autentica como `sp-iop-elt` contra o workspace **dev** via OIDC e roda `databricks current-user me` + `databricks bundle validate --target dev` — só valida que a cadeia de autenticação/config funciona, não faz deploy nem toca em nenhum dado.
+
+---
+
+## Spike: Lakeflow Declarative Pipelines pro lado Oracle
+
+Depois de terminar a base de GitOps (Git Folder, Asset Bundle, SP, OIDC), avaliamos se o **Lakeflow Declarative Pipelines** (o framework declarativo nativo do Databricks pra pipelines de dados — antigo Delta Live Tables) seria uma base melhor que "script Python + Job" pra este projeto. Ver M4 no catálogo de melhorias original.
+
+### Conclusão da avaliação (2026-07-22)
+
+Não é tudo-ou-nada — depende de qual parte do pipeline:
+
+| Parte do pipeline | Lakeflow encaixa? |
+|---|---|
+| Loop das ~28 tabelas Oracle (`NTB02`) e as tabelas simples (`PACIENTE_ATEND_MEDIC`, `GED_ATENDIMENTO`, view de receita, enriquecimento RTF) | ✅ bom encaixe — cada uma vira uma declaração de tabela |
+| Extração da coluna `LONG` (`DS_EVOLUCAO`/`DS_PROTOCOLO`, hoje um loop de threads em blocos de ID) | 🟡 incerto — pode ser que o hack de blocos nem seja mais necessário com um read declarativo simples, mas não testamos ainda |
+| Cópia de arquivos do GED (SMB → Volume) | ❌ não encaixa — é efeito colateral puro (conectar/copiar bytes), não uma transformação de tabela. Lakeflow é feito pra "declarar uma tabela a partir de uma query", não pra isso. **GED continua como Job comum** (é o que já portamos em `create_tb_diferencial_paths`). |
+
+Achados técnicos (verificados via doc oficial, não só teoria):
+- Lakeflow **roda em compute clássico** (não só serverless) — resolve a exigência de rede privada pro Oracle.
+- **Lê de Lakehouse Federation** (nosso `oracle_med4u`) como fonte, mas exige `channel: PREVIEW` na pipeline.
+- É um `resources.pipelines.<nome>` no Asset Bundle — mesmo mecanismo de deploy que já temos, não precisa de infraestrutura nova.
+
+### Spike criado (ainda sem commit, sem ter rodado ainda)
+
+Pipeline mínima, só pra provar viabilidade antes de decidir migrar o resto do lado Oracle:
+
+- `resources/oracle_pipeline_test.pipeline.yml` — pipeline `oracle_pipeline_test`, catálogo/schema `iop.raw`, **`continuous: false`** (roda uma vez, não fica ligada), **compute clássico** (`serverless: false` + `clusters`, não serverless), `channel: PREVIEW`.
+- `pipelines/oracle_test/transformations/paciente_atend_medic_test.py` — declara `_test_lakeflow_paciente_atend_medic` lendo `oracle_med4u.tasy.PACIENTE_ATEND_MEDIC` (a tabela mais simples e pequena do pipeline legado) e escrevendo em `iop.raw._test_lakeflow_paciente_atend_medic` (nome propositalmente marcado como teste — não encosta na tabela real `iop.raw.tb_paciente_atend_medic`).
+- `.github/workflows/run-oracle-lakeflow-test.yml` — **só dispara manualmente** (`workflow_dispatch`, botão "Run workflow" no GitHub) — nunca em push, porque isso faz uma query de verdade contra o Oracle de **produção** e deve rodar fora do horário comercial.
+
+Grants concedidos ao `sp-iop-elt` pra viabilizar isso (2026-07-22, connection/catálogo que antes não tinham grant nenhum além do owner):
+```
+oracle_prod01 (connection)     -> USE_CONNECTION
+oracle_med4u (foreign catalog) -> USE_CATALOG
+oracle_med4u.tasy (schema)     -> USE_SCHEMA, SELECT
+```
+
+`databricks bundle validate --target dev` passou localmente. **Ainda não rodamos de verdade** (nem deploy, nem run) — fica pra quando alguém disparar a Action manualmente, fora do horário comercial.
 
 ---
 

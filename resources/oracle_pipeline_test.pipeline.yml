@@ -1,0 +1,28 @@
+# Pipeline de teste (spike): valida se Lakeflow Declarative Pipelines consegue ler
+# o Oracle via Lakehouse Federation (oracle_med4u) e escrever em iop.raw.
+# Não é a arquitetura final -- só prova de conceito com 1 tabela pequena
+# (PACIENTE_ATEND_MEDIC) antes de decidir migrar o resto do lado Oracle pra cá.
+#
+# continuous: false -> roda uma vez e para (não fica um cluster ligado o tempo todo)
+# serverless: false + clusters -> compute clássico, na VPC do workspace, com rota
+#   de rede pro Oracle (serverless não alcançaria o host privado sem NCC)
+# channel: PREVIEW -> exigido pela Databricks pra ler de Lakehouse Federation
+#   dentro de uma pipeline declarativa
+
+resources:
+  pipelines:
+    oracle_pipeline_test:
+      name: oracle_pipeline_test
+      catalog: iop
+      schema: raw
+      channel: PREVIEW
+      continuous: false
+      serverless: false
+      clusters:
+        - label: default
+          node_type_id: n2-highmem-4
+          num_workers: 1
+
+      libraries:
+        - glob:
+            include: ../pipelines/oracle_test/transformations/**

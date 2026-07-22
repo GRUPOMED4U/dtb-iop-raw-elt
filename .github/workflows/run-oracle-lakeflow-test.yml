@@ -1,0 +1,30 @@
+name: Run Oracle Lakeflow Test Pipeline (manual)
+
+# Só dispara manualmente (botão "Run workflow" no GitHub) -- nunca em push.
+# Isso faz uma query de verdade contra o Oracle de produção (via oracle_med4u),
+# então só rodar fora do horário comercial.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: https://8259557250383794.4.gcp.databricks.com
+      DATABRICKS_CLIENT_ID: 83de5c11-53ff-4142-bee7-7fc04713f273
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy bundle (dev)
+        run: databricks bundle deploy --target dev
+
+      - name: Roda a pipeline de teste (oracle_pipeline_test)
+        run: databricks bundle run oracle_pipeline_test --target dev
