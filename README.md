@@ -160,16 +160,53 @@ Schemas: `default`, `elt`, `gold`, `raw`, `silver` (+ `information_schema`). Tod
 
 A camada `raw` é a única escrita por este pipeline. `silver`/`gold`/`elt` são consumidos ou escritos por pipelines a jusante (ex.: `iop.silver.desfecho`, ver [Consumidores](#consumidores-conhecidos-do-iopraw)).
 
-### Grants no catálogo (verificado em 2026-07-21)
+### Grants no catálogo
+
+Estado **antes** da migração (verificado em 2026-07-21):
 
 ```
-principal: <group-id> ab86adaf-f2b3-4122-9ef8-2b3a917b754e   → USE_CATALOG
-principal: account users                                     → ALL_PRIVILEGES
+principal: sp-biomarcadores (service principal, app id ab86adaf-f2b3-4122-9ef8-2b3a917b754e)  → USE_CATALOG
+principal: account users                                                                       → ALL_PRIVILEGES
 ```
 
-Ver [Achados de governança](#achados-de-governança) — o grant de `account users` é bem mais permissivo do que deveria.
+**Decisão da Etapa 1 (2026-07-21):** em vez de criar grupos dedicados a este projeto, reaproveitar os grupos de dados que já existem no nível da conta (`spesia-data-ro`/`rw`/`admins`), espelhando exatamente o modelo já usado no catálogo irmão `spesia`. Estratégia de rollout: **grants aditivos primeiro, revogação do grant amplo depois** — nada é retirado de ninguém até termos confiança de que nada depende só do `account users: ALL_PRIVILEGES` (candidato a dependência oculta: o app `desfecho-comissao`, que lê um Volume em `iop.silver` e pode estar se apoiando nesse grant amplo sem estar documentado em lugar nenhum).
 
-`spesia-data-admins` (grupo do qual Lucas e Leonardo Pinheiro fazem parte) é metastore admin — pode revisar/conceder grants em `iop` livremente, sem depender do Jefferson.
+**Aplicado em 2026-07-21** (aditivo, via `databricks grants update catalog iop`):
+
+```sql
+GRANT SELECT, USE_CATALOG, USE_SCHEMA, EXECUTE, READ_VOLUME ON CATALOG iop TO `spesia-data-ro`;
+GRANT SELECT, USE_CATALOG, USE_SCHEMA, EXECUTE, READ_VOLUME,
+      CREATE_SCHEMA, CREATE_TABLE, CREATE_FUNCTION, CREATE_VOLUME, MODIFY, WRITE_VOLUME
+      ON CATALOG iop TO `spesia-data-rw`;
+GRANT ALL PRIVILEGES ON CATALOG iop TO `spesia-data-admins`;
+```
+
+Estado atual do catálogo `iop`:
+
+```
+spesia-data-ro        → SELECT, USE_CATALOG, USE_SCHEMA, EXECUTE, READ_VOLUME
+spesia-data-rw        → tudo do ro + CREATE_SCHEMA/TABLE/FUNCTION/VOLUME, MODIFY, WRITE_VOLUME
+spesia-data-admins    → ALL_PRIVILEGES
+sp-biomarcadores      → USE_CATALOG (inalterado)
+account users         → ALL_PRIVILEGES (⚠️ ainda não revogado — de propósito, ver acima)
+```
+
+`spesia-data-admins` (grupo do qual Lucas e Leonardo Pinheiro fazem parte) já era metastore admin antes disso — pode revisar/conceder grants em `iop` livremente, sem depender do Jefferson. O grant explícito de `ALL_PRIVILEGES` ao grupo só deixa isso visível/auditável nos grants do catálogo, igual já era feito em `spesia`.
+
+### Grupos e service principals da conta
+
+Levantado em 2026-07-21 via `databricks account groups list` / `databricks account service-principals list`:
+
+| Principal | Tipo | Membros / uso atual |
+|---|---|---|
+| `spesia-data-admins` | Grupo (account-level) | Lucas Santiago, Leonardo Pinheiro — metastore admins |
+| `spesia-data-rw` | Grupo (account-level) | Ynara Favoretto — leitura+escrita em dados |
+| `spesia-data-ro` | Grupo (account-level) | (sem membros no momento) — só leitura |
+| `usr_dados_dtb` | Grupo (account-level) | (sem membros no momento) — propósito não confirmado, perguntar ao time antes de assumir para que serve |
+| `sp-biomarcadores` | Service principal | usado pelo projeto `biomarcadores-app`/`clinical-doc-extractor` |
+| `app-1zinji desfecho-comissao` | Service principal | auto-criado pelo Databricks App `desfecho-comissao`, não é algo a replicar manualmente |
+
+**Decisão da Etapa 1:** este projeto terá seu próprio service principal dedicado para rodar os jobs do Asset Bundle (padrão `sp-biomarcadores`), a ser criado quando chegarmos na etapa de escrever o `databricks.yml` — com grants least-privilege (`USE CONNECTION` na `oracle_prod01` + acesso a `oracle_med4u` + escrita em `iop.raw`). Ainda não criado.
 
 ---
 
@@ -263,7 +300,7 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 
 ## Achados de governança
 
-- **`account users` tem `ALL_PRIVILEGES` no catálogo `iop` inteiro.** Isso é bem mais permissivo do que deveria — qualquer usuário da conta Databricks pode ler/escrever/conceder grants em qualquer schema/tabela de `iop`, incluindo dados clínicos sensíveis. Não é bloqueante para a migração, mas é dívida técnica de segurança que vale revisar (possivelmente depois do cutover, para não mascarar dependências que dependam desse grant amplo).
+- **`account users` tem `ALL_PRIVILEGES` no catálogo `iop` inteiro.** Isso é bem mais permissivo do que deveria — qualquer usuário da conta Databricks pode ler/escrever/conceder grants em qualquer schema/tabela de `iop`, incluindo dados clínicos sensíveis. **Em andamento (2026-07-21):** os grants corretos (`spesia-data-ro`/`rw`/`admins`, espelhando o catálogo `spesia`) já foram concedidos de forma aditiva, sem revogar nada ainda. O `account users: ALL_PRIVILEGES` continua ativo de propósito — será revogado só depois de um período observando quem efetivamente depende dele (candidato suspeito: o app `desfecho-comissao`, que lê um Volume em `iop.silver` sob uma identidade própria de service principal e pode estar contando com esse grant amplo).
 
 ---
 
@@ -271,13 +308,17 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 
 | Componente | Estado |
 |---|---|
-| Repositório Git + `README.md` + `CLAUDE.md` | ✅ feito (este commit) |
+| Repositório Git + `README.md` + `CLAUDE.md` | ✅ feito |
+| Decisões da Etapa 1 (M4 fica pra depois, grupos reaproveitados, SP dedicado, grants aditivos) | ✅ feito (2026-07-21) |
+| Grants aditivos `spesia-data-ro/rw/admins` no `iop` | ✅ feito (2026-07-21) — `account users: ALL_PRIVILEGES` ainda ativo de propósito |
 | Portar notebooks para `.py` versionável | ❌ não iniciado |
 | Databricks Asset Bundle (`databricks.yml`) | ❌ não iniciado |
 | Job clusters no lugar de clusters interativos | ❌ não iniciado |
 | CI (lint/testes) | ❌ não iniciado |
 | Carga incremental (watermark/MERGE) | ❌ não iniciado — hoje só `EVOLUCAO_PACIENTE`/`PROTOCOLO` têm alguma incrementalidade parcial (extração da coluna LONG), o full-load principal continua overwrite total |
-| Ownership em grupo/service principal | ❌ não iniciado — tudo ainda em nome do Jefferson |
+| Service principal dedicado (`sp-iop-elt`) | ❌ não criado — planejado para quando o Asset Bundle for escrito |
+| Ownership de jobs/notebooks/connections | ❌ não iniciado — tudo ainda em nome do Jefferson |
+| Revogar `account users: ALL_PRIVILEGES` no `iop` | ❌ não feito — de propósito, aguardando confiança de que nada depende só dele |
 | Cutover em produção | ❌ não iniciado — **os 2 jobs legados continuam rodando exatamente como estão** |
 
 **Nada foi portado ainda.** Toda a lógica de produção descrita neste README ainda roda exclusivamente como notebooks na pasta pessoal do Jefferson, sem Git.
