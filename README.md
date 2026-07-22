@@ -323,10 +323,10 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 | Grants aditivos `spesia-data-ro/rw/admins` no `iop` | ✅ feito (2026-07-21) — `account users: ALL_PRIVILEGES` ainda ativo de propósito |
 | Git Folder no workspace (`/Repos/spesia_product/dtb-iop-raw-elt`) | ✅ feito (2026-07-22) |
 | Service principal dedicado (`sp-iop-elt`) | ✅ criado (2026-07-22), membro de `spesia-data-rw` |
-| Autenticação CI via Workload Identity Federation (OIDC, sem secret) | ✅ feito (2026-07-22) — 2 federation policies (dev/prod) |
+| Autenticação CI via Workload Identity Federation (OIDC, sem secret) | ✅ **validado de ponta a ponta** (2026-07-22) — policy de dev confirmada rodando na Action; policy de prod criada mas ainda não testada |
 | GitHub Environments `dev`/`prod` | ✅ feito (2026-07-22) — `prod` sem revisor obrigatório ainda (ver Riscos) |
-| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto criado (2026-07-22) — 2 targets, **nenhum job/resource ainda** |
-| GitHub Action de teste de conexão (`test-connection.yml`) | ✅ feito (2026-07-22) — só autentica + valida bundle, não deploya nada |
+| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto criado e validado (2026-07-22, `bundle validate` passou local e em CI) — 2 targets, **nenhum job/resource ainda** |
+| GitHub Action de teste de conexão (`test-connection.yml`) | ✅ **rodou com sucesso em produção** (2026-07-22) — autenticou como `sp-iop-elt`, validou o bundle, não deploya nada |
 | GitHub Action de deploy automático (dev on push / prod manual) | ❌ não iniciado — só faz sentido quando houver um job completo pra deployar |
 | Portar notebooks para `.py` versionável | 🟡 1 de ~14 portado localmente (`create_tb_diferencial_paths`/`NTB01`, `load_files_ged`) — **ainda não commitado**, em revisão |
 | Job clusters no lugar de clusters interativos | ❌ não iniciado |
@@ -381,17 +381,32 @@ Service principal dedicado para rodar deploys/jobs deste projeto — nunca usuá
 
 ### 4. Autenticação do CI: Workload Identity Federation (OIDC), sem secret nenhum
 
-O GitHub Actions autentica como `sp-iop-elt` via **OIDC federation** — nenhum token/senha fica guardado no GitHub. Duas federation policies foram criadas no `sp-iop-elt` (uma por ambiente):
+O GitHub Actions autentica como `sp-iop-elt` via **OIDC federation** — nenhum token/senha fica guardado no GitHub. Duas federation policies foram criadas no `sp-iop-elt` (uma por ambiente) e **validadas de ponta a ponta em produção** (`databricks current-user me` rodando na Action retornou `sp-iop-elt` corretamente, 2026-07-22).
 
 ```bash
 databricks account service-principal-federation-policy create 217897259508188 --json '{
   "oidc_policy": {
     "issuer": "https://token.actions.githubusercontent.com",
-    "audiences": ["804f131d-b219-46da-9cc6-c2a511f6f911"],
-    "subject": "repo:GRUPOMED4U/dtb-iop-raw-elt:environment:<dev|prod>"
+    "audiences": ["https://<workspace-host>/oidc/v1/token"],
+    "subject": "repo:<org>@<org_id>/<repo>@<repo_id>:environment:<dev|prod>"
   }
 }'
 ```
+
+**⚠️ Duas armadilhas descobertas só ao testar de verdade** (a doc genérica da Databricks não deixa isso claro):
+
+1. **`audience`** não é o account id — é a **URL do endpoint OIDC do workspace específico**: `https://<workspace-host>/oidc/v1/token`. Cada policy (dev/prod) tem um audience diferente, porque cada uma autentica contra um workspace diferente.
+2. **`subject`** não é só `repo:org/repo:environment:nome` — o GitHub inclui os **IDs imutáveis** de org e repo: `repo:GRUPOMED4U@197661296/dtb-iop-raw-elt@1308299119:environment:dev`. Isso protege contra hijacking se alguém renomear a org/repo, mas quebra silenciosamente qualquer policy configurada só com os nomes.
+
+Os valores corretos e já validados (dev):
+```json
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audiences": ["https://8259557250383794.4.gcp.databricks.com/oidc/v1/token"],
+  "subject": "repo:GRUPOMED4U@197661296/dtb-iop-raw-elt@1308299119:environment:dev"
+}
+```
+(a policy de `prod` é idêntica, trocando o audience pelo host de prod e `:environment:prod` — **ainda não validada de verdade**, só a de dev rodou com sucesso até agora).
 
 O `subject` amarra a autenticação a um **GitHub Environment** específico (`dev` ou `prod`) — só um workflow rodando sob aquele ambiente consegue o token OIDC com o claim certo para autenticar.
 
