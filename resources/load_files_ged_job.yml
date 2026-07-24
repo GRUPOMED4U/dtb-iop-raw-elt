@@ -1,0 +1,34 @@
+# Job manual (sem schedule) pra validar o port do GED antes do cutover.
+# Só a task carga_files_ged_raw_test -- lê o backlog real de iop.raw.tb_processados_join
+# (só leitura) e copia os arquivos reais do GED via SMB, mas escreve em destinos de
+# teste (tabela/volume com sufixo _test), pra não colidir com o job legado
+# `load_files_ged` que roda em produção todo dia às 4h. Ver README, seção do GED.
+#
+# job_cluster (não existing_cluster_id) -- primeiro passo rumo à modernização M1
+# (clusters interativos -> job clusters), já nasce no padrão certo.
+
+resources:
+  jobs:
+    load_files_ged_test:
+      name: load_files_ged_test
+      job_clusters:
+        - job_cluster_key: ged_cluster
+          new_cluster:
+            spark_version: 18.1.x-scala2.13
+            node_type_id: e2-highmem-2
+            data_security_mode: USER_ISOLATION
+            autoscale:
+              min_workers: 1
+              max_workers: 10
+
+      tasks:
+        - task_key: carga_files_ged_raw_test
+          job_cluster_key: ged_cluster
+          max_retries: 2
+          spark_python_task:
+            python_file: ../databricks/tasks/carga_files_ged_raw_test.py
+          libraries:
+            - whl: ../dist/*.whl
+          email_notifications:
+            on_failure:
+              - lucas.santiago@spesia.com.br

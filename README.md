@@ -189,6 +189,8 @@ spesia-data-ro        → SELECT, USE_CATALOG, USE_SCHEMA, EXECUTE, READ_VOLUME
 spesia-data-rw        → tudo do ro + CREATE_SCHEMA/TABLE/FUNCTION/VOLUME, MODIFY, WRITE_VOLUME
 spesia-data-admins    → ALL_PRIVILEGES
 sp-biomarcadores      → USE_CATALOG (inalterado)
+sp-iop-elt            → USE_CATALOG (travessia) + USE_SCHEMA/SELECT/CREATE_TABLE/CREATE_VOLUME/CREATE_FUNCTION/MODIFY/WRITE_VOLUME/READ_VOLUME/EXECUTE só em iop.raw
+sp-iop-silver-elt     → USE_CATALOG (travessia) + USE_SCHEMA/SELECT em iop.raw (leitura) + USE_SCHEMA/SELECT/CREATE_TABLE/CREATE_VOLUME/MODIFY em iop.silver (escrita) — SP dedicado ao repo dtb-iop-silver-elt, ver docs/silver-layer-handoff.md
 account users         → ALL_PRIVILEGES (⚠️ ainda não revogado — de propósito, ver acima)
 ```
 
@@ -206,6 +208,7 @@ Levantado em 2026-07-21 via `databricks account groups list` / `databricks accou
 | `usr_dados_dtb` | Grupo (account-level) | (sem membros no momento) — propósito não confirmado, perguntar ao time antes de assumir para que serve |
 | `sp-biomarcadores` | Service principal | usado pelo projeto `biomarcadores-app`/`clinical-doc-extractor` |
 | `app-1zinji desfecho-comissao` | Service principal | auto-criado pelo Databricks App `desfecho-comissao`, não é algo a replicar manualmente |
+| `sp-iop-silver-elt` | Service principal | **criado em 2026-07-23** — application id (client id) `d9304262-1a5a-498f-96ed-d9099bb9adff`, account id (SCIM) `211855069202202`. Dedicado à camada `iop.silver`, agora rodando no repo próprio [`GRUPOMED4U/dtb-iop-silver-elt`](https://github.com/GRUPOMED4U/dtb-iop-silver-elt), replicando o isolamento do `sp-iop-elt` (ver [`docs/silver-layer-handoff.md`](docs/silver-layer-handoff.md)). Grants aplicados (leitura em `iop.raw`, escrita em `iop.silver`), workspace access `USER` em dev+prod, entitlement `allow-cluster-create` em dev, GitHub Environments `dev`/`prod` e federation policies OIDC (dev+prod) já criados — **ainda não validados rodando de verdade** (a Action `test-connection.yml` desse repo é o primeiro teste real). |
 
 **Decisão da Etapa 1:** este projeto terá seu próprio service principal dedicado para rodar os jobs do Asset Bundle (padrão `sp-biomarcadores`), a ser criado quando chegarmos na etapa de escrever o `databricks.yml` — com grants least-privilege (`USE CONNECTION` na `oracle_prod01` + acesso a `oracle_med4u` + escrita em `iop.raw`). Ainda não criado.
 
@@ -255,6 +258,20 @@ GED_TIPO_ARQUIVO, IOP_ESTABELECIMENTO_RELATORIO
 
 1. **`NTB01_create_table_pathsfiles_onprimess`** — conecta via SMB (`smbprotocol`), lista arquivos do share, grava `iop.raw.tb_pathfiles_ged_aprocessar` (overwrite) e cruza (`chave_filename = sha2(filename, 256)`) contra `iop.raw.tb_result_carga_files_ged` para montar `iop.raw.tb_processados_join`, marcando o que já foi processado.
 2. **`NTB02_extract_files_GED_load_lake`** — lê `tb_processados_join WHERE processed_at IS NULL`, copia os bytes via SMB em paralelo (`mapInPandas`, batches de 5.000, ~40 partições) para `/Volumes/iop/raw/files/GED/`, grava resultado incremental (sucesso/erro por arquivo) em `iop.raw.tb_result_carga_files_ged`, e roda `OPTIMIZE` no final.
+
+#### Porte do GED pra `.py` versionável (2026-07-24)
+
+Os dois notebooks do job `load_files_ged` já foram portados como código testável (ainda não commitado, em revisão):
+
+- **`NTB01` → `create_tb_diferencial_paths`**: lógica em [`src/dtb_iop_raw_elt/ged/diff_pathfiles.py`](src/dtb_iop_raw_elt/ged/diff_pathfiles.py), entrypoint em [`databricks/tasks/create_tb_diferencial_paths.py`](databricks/tasks/create_tb_diferencial_paths.py), testes em [`tests/ged/test_diff_pathfiles.py`](tests/ged/test_diff_pathfiles.py). Escreve nos nomes reais de produção (`tb_pathfiles_ged_aprocessar`, `tb_processados_join`).
+- **`NTB02` → `carga_files_ged_raw`**: lógica em [`src/dtb_iop_raw_elt/ged/carga_files.py`](src/dtb_iop_raw_elt/ged/carga_files.py) — tabela/volume de destino são parâmetros de `run()`, não hardcoded, justamente para permitir apontar pra destinos de teste sem duplicar a lógica.
+  - Entrypoint de produção: [`databricks/tasks/carga_files_ged_raw.py`](databricks/tasks/carga_files_ged_raw.py) (destinos reais, default).
+  - Entrypoint de teste: [`databricks/tasks/carga_files_ged_raw_test.py`](databricks/tasks/carga_files_ged_raw_test.py) — mesma lógica, lê o backlog real de `tb_processados_join` (só leitura) e copia os arquivos reais do GED via SMB, mas grava em `iop.raw.tb_result_carga_files_ged_test` e `/Volumes/iop/raw/files/GED_test/` — não toca nos destinos reais usados pelo job legado.
+  - Testes em [`tests/ged/test_carga_files.py`](tests/ged/test_carga_files.py) (só a lógica pura — `chunk_ids`/`copy_one_file` — não cobre `mapInPandas`/SMB de verdade, mesmo critério já usado no `NTB01`).
+
+**Job manual criado pra validar isso**: [`resources/load_files_ged_job.yml`](resources/load_files_ged_job.yml) declara `load_files_ged_test`, com uma única task (`carga_files_ged_raw_test`), **sem schedule** (só dispara manualmente), `job_cluster` (não `existing_cluster_id` — primeiro passo rumo à modernização M1), `max_retries: 2`. Alerta por e-mail em falha só pra `lucas.santiago@spesia.com.br` — **decisão explícita de tirar o Jefferson** desse alerta (job novo, não o legado; o job legado `load_files_ged` continua alertando os dois, inalterado).
+
+**Gatilho manual via GitHub Actions**: [`.github/workflows/run-ged-load-test.yml`](.github/workflows/run-ged-load-test.yml) — mesmo padrão do `run-oracle-lakeflow-test.yml` (só `workflow_dispatch`, nunca em push), autentica como `sp-iop-elt` via OIDC contra o workspace dev, `databricks bundle deploy --target dev` + `databricks bundle run load_files_ged_test --target dev`. `databricks bundle validate --target dev` passou localmente; **ainda não disparamos essa Action** — fica pra quando alguém clicar em "Run workflow".
 
 ---
 
@@ -326,12 +343,12 @@ Reatribuir isso é **mecânico**, não bloqueante — quem tiver privilégio de 
 | Service principal dedicado (`sp-iop-elt`) | ✅ criado (2026-07-22) — grants escopados só a `iop.raw` (corrigido depois de ter sido criado catalog-wide via `spesia-data-rw`; acesso ao workspace agora é direto, não por grupo) |
 | Autenticação CI via Workload Identity Federation (OIDC, sem secret) | ✅ **validado de ponta a ponta** (2026-07-22) — policy de dev confirmada rodando na Action; policy de prod criada mas ainda não testada |
 | GitHub Environments `dev`/`prod` | ✅ feito (2026-07-22) — `prod` sem revisor obrigatório ainda (ver Riscos) |
-| Databricks Asset Bundle (`databricks.yml`) | 🟡 esqueleto validado (2026-07-22) — 2 targets, 1 resource de pipeline (spike, ver abaixo), nenhum job de produção ainda |
+| Databricks Asset Bundle (`databricks.yml`) | 🟡 2 targets + `artifacts` (wheel) + 2 resources (`oracle_pipeline_test` spike, `load_files_ged_test` job manual) — `bundle validate` passa, nenhum job de produção ainda |
 | GitHub Action de teste de conexão (`test-connection.yml`) | ✅ **rodou com sucesso em produção** (2026-07-22) — autenticou como `sp-iop-elt`, validou o bundle, não deploya nada |
-| Spike Lakeflow Declarative Pipelines (Oracle) | 🟡 arquivos criados, `bundle validate` passou local (2026-07-22) — **ainda não deployado nem rodado de verdade**, ver [seção dedicada](#spike-lakeflow-declarative-pipelines-pro-lado-oracle) |
+| Spike Lakeflow Declarative Pipelines (Oracle) | ✅ **validado em produção** (2026-07-23, 1 tabela) — expandido pra ~28 tabelas do loop genérico em 2026-07-24, **ainda não rodado** com o conjunto maior, ver [seção dedicada](#spike-lakeflow-declarative-pipelines-pro-lado-oracle) |
 | GitHub Action de deploy automático (dev on push / prod manual) | ❌ não iniciado — só faz sentido quando houver um job completo pra deployar |
-| Portar notebooks para `.py` versionável | 🟡 1 de ~14 portado localmente (`create_tb_diferencial_paths`/`NTB01`, `load_files_ged`) — **ainda não commitado**, em revisão |
-| Job clusters no lugar de clusters interativos | ❌ não iniciado |
+| Portar notebooks para `.py` versionável | 🟡 2 de ~14 portados localmente (`create_tb_diferencial_paths`/`NTB01` e `carga_files_ged_raw`/`NTB02`, job `load_files_ged` — ver [seção do GED](#ged)) — **ainda não commitado**, em revisão |
+| Job clusters no lugar de clusters interativos | 🟡 usado no job de teste `load_files_ged_test` (`job_clusters`, não `existing_cluster_id`) — ainda não aplicado aos jobs reais em produção |
 | CI (lint/testes) | 🟡 estrutura de testes criada (`pytest`), ainda não rodada em CI |
 | Carga incremental (watermark/MERGE) | ❌ não iniciado — hoje só `EVOLUCAO_PACIENTE`/`PROTOCOLO` têm alguma incrementalidade parcial (extração da coluna LONG), o full-load principal continua overwrite total |
 | Ownership de jobs/notebooks/connections legados | ❌ não iniciado — tudo ainda em nome do Jefferson |
@@ -357,9 +374,9 @@ databricks repos create "https://github.com/GRUPOMED4U/dtb-iop-raw-elt.git" gitH
 
 Isso dá uma cópia navegável/editável do código dentro do Databricks, sincronizada com o GitHub — o mesmo mecanismo já usado por `iop-extract` e `natural-language-extractors` (pasta compartilhada `/Repos/spesia_product/`, não pessoal). **Importante:** essa sincronização não é automática a cada push — é preciso rodar `databricks repos update` (ou usar a UI) para puxar commits novos para o Git Folder.
 
-### 2. Databricks Asset Bundle (esqueleto criado em 2026-07-22, sem jobs ainda)
+### 2. Databricks Asset Bundle (esqueleto de 2026-07-22 + primeiro job manual em 2026-07-24)
 
-O deploy real dos jobs/clusters/schedules é feito via Asset Bundle (`databricks.yml`), replicando o padrão do `clinical-doc-extractor` (que foi deployado assim, não a partir do Git Folder). Hoje o `databricks.yml` só declara os 2 targets — **nenhum job/resource ainda**, porque só portamos 1 de ~14 notebooks até agora:
+O deploy real dos jobs/clusters/schedules é feito via Asset Bundle (`databricks.yml`), replicando o padrão do `clinical-doc-extractor` (que foi deployado assim, não a partir do Git Folder). Além dos 2 targets, o bundle já declara um `artifacts` (build do wheel do pacote `dtb_iop_raw_elt` via `pip wheel . --no-deps -w dist`), o `resources/oracle_pipeline_test.pipeline.yml` (spike Lakeflow) e o `resources/load_files_ged_job.yml` (job manual `load_files_ged_test`, ver [seção do GED](#ged)) — ainda nenhum job real de produção:
 
 ```yaml
 targets:
@@ -442,22 +459,23 @@ Achados técnicos (verificados via doc oficial, não só teoria):
 - **Lê de Lakehouse Federation** (nosso `oracle_med4u`) como fonte, mas exige `channel: PREVIEW` na pipeline.
 - É um `resources.pipelines.<nome>` no Asset Bundle — mesmo mecanismo de deploy que já temos, não precisa de infraestrutura nova.
 
-### Spike criado (ainda sem commit, sem ter rodado ainda)
+### Spike criado e validado em produção (2026-07-23)
 
 Pipeline mínima, só pra provar viabilidade antes de decidir migrar o resto do lado Oracle:
 
 - `resources/oracle_pipeline_test.pipeline.yml` — pipeline `oracle_pipeline_test`, catálogo/schema `iop.raw`, **`continuous: false`** (roda uma vez, não fica ligada), **compute clássico** (`serverless: false` + `clusters`, não serverless), `channel: PREVIEW`.
 - `pipelines/oracle_test/transformations/paciente_atend_medic_test.py` — declara `_test_lakeflow_paciente_atend_medic` lendo `oracle_med4u.tasy.PACIENTE_ATEND_MEDIC` (a tabela mais simples e pequena do pipeline legado) e escrevendo em `iop.raw._test_lakeflow_paciente_atend_medic` (nome propositalmente marcado como teste — não encosta na tabela real `iop.raw.tb_paciente_atend_medic`).
+- `pipelines/oracle_test/transformations/raw_tables_loop_test.py` — **adicionado em 2026-07-24**, depois da run de sucesso. Replica o mesmo padrão (`spark.read.table("oracle_med4u.tasy.<TABELA>")` → `_test_lakeflow_<tabela>`) para as **~28 tabelas do loop genérico de full-load** (`NTB02_extract_oracle_load_lake`), geradas dinamicamente num loop Python (mesmo espírito do notebook legado, que também é uma lista + loop). **Não inclui**: `EVOLUCAO_PACIENTE`/`PROTOCOLO` (extração de coluna `LONG` via threads + limpeza RTF — ainda incerto se encaixa em Lakeflow, ver avaliação acima) nem `GED_ATENDIMENTO`/a view de receita (JDBC direto, não passam pela Lakehouse Federation `oracle_med4u` — precisariam de outra fonte na pipeline). Ainda escreve só em tabelas `_test_lakeflow_*`, nenhuma tabela real de produção é tocada.
 - `.github/workflows/run-oracle-lakeflow-test.yml` — **só dispara manualmente** (`workflow_dispatch`, botão "Run workflow" no GitHub) — nunca em push, porque isso faz uma query de verdade contra o Oracle de **produção** e deve rodar fora do horário comercial.
 
-Grants concedidos ao `sp-iop-elt` pra viabilizar isso (2026-07-22, connection/catálogo que antes não tinham grant nenhum além do owner):
+Grants concedidos ao `sp-iop-elt` pra viabilizar isso (2026-07-22, connection/catálogo que antes não tinham grant nenhum além do owner) — cobrem qualquer tabela do schema `oracle_med4u.tasy`, então as 28 novas não precisaram de nenhum grant adicional:
 ```
 oracle_prod01 (connection)     -> USE_CONNECTION
 oracle_med4u (foreign catalog) -> USE_CATALOG
 oracle_med4u.tasy (schema)     -> USE_SCHEMA, SELECT
 ```
 
-`databricks bundle validate --target dev` passou localmente. **Ainda não rodamos de verdade** (nem deploy, nem run) — fica pra quando alguém disparar a Action manualmente, fora do horário comercial.
+**Rodou de verdade em produção em 2026-07-23** (`run-oracle-lakeflow-test.yml`, run [`29969421348`](https://github.com/GRUPOMED4U/dtb-iop-raw-elt/actions/runs/29969421348)) — `success`, depois de uma primeira tentativa que falhou (`29969174564`). A expansão pras 28 tabelas (2026-07-24) **ainda não rodou** — só validamos até aqui com a tabela única.
 
 ---
 
@@ -479,3 +497,5 @@ oracle_med4u.tasy (schema)     -> USE_SCHEMA, SELECT
 
 - `docs/08-MELHORIAS-ELT-IOP.md` no repositório `biomarcadores-app` (branch `BRI-11-migration-databricks`) — análise original que motivou esta migração.
 - `databricks.yml` do projeto `clinical-doc-extractor` — padrão de Asset Bundle GitOps a seguir.
+- [`docs/lakeflow-declarative-pipelines.md`](docs/lakeflow-declarative-pipelines.md) — receita técnica completa de como validamos Lakeflow Declarative Pipelines + GitOps via OIDC (service principal, grants, federation policy, `databricks.yml`).
+- [`docs/silver-layer-handoff.md`](docs/silver-layer-handoff.md) — contexto e checklist de handoff pro Leonardo, pra construir a camada `iop.silver` como projeto separado.

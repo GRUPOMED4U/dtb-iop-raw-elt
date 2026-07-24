@@ -4,6 +4,12 @@ bundle:
 include:
   - resources/*.yml
 
+artifacts:
+  dtb_iop_raw_elt:
+    type: whl
+    build: pip wheel . --no-deps -w dist
+    path: .
+
 targets:
   dev:
     mode: development
