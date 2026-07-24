@@ -1,6 +1,8 @@
 """Spike: mesma validação de paciente_atend_medic_test.py, mas para as ~28 tabelas
-do loop genérico de full-load (NTB02_extract_oracle_load_lake). Tabelas de teste,
-não fazem parte do pipeline real -- ver resources/oracle_pipeline_test.pipeline.yml.
+do loop genérico de full-load (NTB02_extract_oracle_load_lake), mais as tabelas
+descobertas via docs/Barramento_Selena_Inventario_Frontend.docx (tabelas Tasy
+usadas de verdade pelo frontend web, ainda ausentes de iop.raw). Tabelas de
+teste, não fazem parte do pipeline real -- ver resources/oracle_pipeline_test.pipeline.yml.
 
 Não inclui EVOLUCAO_PACIENTE/PROTOCOLO (extração de coluna LONG via threads+RTF,
 ainda não validada em Lakeflow) nem GED_ATENDIMENTO/view de receita (JDBC direto,
@@ -40,6 +42,26 @@ RAW_LOOP_TABLES = [
     "IOP_ESTABELECIMENTO_RELATORIO",
 ]
 
+# Tabelas Tasy usadas de verdade por fluxos ativos do frontend (checkout, protocolos,
+# loco-regional, detalhes do paciente), levantadas em
+# docs/Barramento_Selena_Inventario_Frontend.docx (2026-07-24) e ainda ausentes de
+# iop.raw. Não inclui as tabelas do doc que só aparecem em código morto/endpoints
+# sem caller no frontend (MEDICO, USUARIO, PROCEDIMENTO, ATEND_PACIENTE_UNIDADE,
+# CIDO_TOPOGRAFIA) -- menor prioridade, avaliar depois.
+BARRAMENTO_SELENA_TABLES = [
+    "ATENDIMENTO_PACIENTE",
+    "PACIENTE_ATEND_PROC",
+    "ATEND_CATEGORIA_CONVENIO",
+    "CAN_TNM_CLASSIF",
+    "MED_RECEITA",
+    "ATESTADO_PACIENTE",
+    "PROTOCOLO_MEDIC_MATERIAL",
+    "PROTOCOLO_MEDICACAO",
+    "PROTOCOLO_MEDIC_PROC",
+    "TIPO_ALERGIA",
+    "PACIENTE_MEDIC_USO",
+]
+
 
 def _make_test_table(table_name):
     @dp.table(name=f"_test_lakeflow_{table_name.lower()}")
@@ -49,5 +71,5 @@ def _make_test_table(table_name):
     return _test_table
 
 
-for _table_name in RAW_LOOP_TABLES:
+for _table_name in RAW_LOOP_TABLES + BARRAMENTO_SELENA_TABLES:
     _make_test_table(_table_name)
